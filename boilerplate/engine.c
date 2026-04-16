@@ -16,6 +16,7 @@
  */
 
 #define _GNU_SOURCE
+#include <sched.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -467,6 +468,26 @@ static int cmd_start(int argc, char *argv[])
     return send_control_request(&req);
 }
 
+int container_exec(void *arg)
+{
+    control_request_t *req = (control_request_t *)arg;
+
+    if (chroot(req->rootfs) != 0) {
+        perror("chroot failed");
+        return 1;
+    }
+
+    if (chdir("/") != 0) {
+        perror("chdir failed");
+        return 1;
+    }
+
+    execl(req->command, req->command, NULL);
+
+    perror("exec failed");
+    return 1;
+}
+
 static int cmd_run(int argc, char *argv[])
 {
     control_request_t req;
@@ -489,7 +510,51 @@ static int cmd_run(int argc, char *argv[])
     if (parse_optional_flags(&req, argc, argv, 5) != 0)
         return 1;
 
-    return send_control_request(&req);
+        printf("[INFO] Running container %s with rootfs %s\n",
+           req.container_id, req.rootfs);
+
+    #define STACK_SIZE (1024 * 1024)
+
+char *stack = malloc(STACK_SIZE);
+if (!stack) {
+    perror("malloc failed");
+    return 1;
+}
+
+char *stack_top = stack + STACK_SIZE;
+
+pid_t pid = clone(container_exec, stack_top,
+                  CLONE_NEWPID | CLONE_NEWNS | SIGCHLD,
+                  &req);
+
+if (pid < 0) {
+    perror("clone failed");
+    return 1;
+}
+int fd = open("/dev/container_monitor", O_RDWR);
+if (fd < 0) {
+    perror("open monitor device failed");
+} else {
+    struct monitor_request mreq;
+    memset(&mreq, 0, sizeof(mreq));
+
+    mreq.pid = pid;
+    mreq.soft_limit_bytes = req.soft_limit_bytes;
+    mreq.hard_limit_bytes = req.hard_limit_bytes;
+    strncpy(mreq.container_id, req.container_id, MONITOR_NAME_LEN - 1);
+
+    printf("[INFO] Registering container %s (PID %d) to kernel monitor\n",
+           mreq.container_id, mreq.pid);
+
+    if (ioctl(fd, MONITOR_REGISTER, &mreq) < 0) {
+        perror("ioctl MONITOR_REGISTER failed");
+    }
+
+    close(fd);
+}
+waitpid(pid, NULL, 0);
+printf("[INFO] Container %s finished\n", req.container_id);
+    return 0;
 }
 
 static int cmd_ps(void)
